@@ -1,6 +1,6 @@
 name = "nostr-kind1-csv"
 main = "./.svelte-kit/cloudflare/_worker.js"
-compatibility_date = "2025-10-26"
+compatibility_date = "2025-10-25"
 
 [site]
 # Adapter writes static assets/prerendered pages here during `pnpm run build`

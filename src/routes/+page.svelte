@@ -10,6 +10,16 @@
 	let errorMessage = $state('');
 	let successMessage = $state('');
 
+	const CHUNK_EVENT_LIMIT = 500;
+	const CHUNK_TIMEOUT_MS = 10_000;
+
+	type Kind1Filter = {
+		kinds: number[];
+		authors: string[];
+		limit?: number;
+		until?: number;
+	};
+
 	// CSVエスケープ関数
 	function escapeCSV(value: string): string {
 		if (value.includes('"') || value.includes(',') || value.includes('\n')) {
@@ -39,6 +49,40 @@
 			.filter((url) => url.length > 0);
 	}
 
+	async function fetchChunkFromRelays(
+		pool: SimplePool,
+		relays: string[],
+		filter: Kind1Filter,
+		timeoutMs = CHUNK_TIMEOUT_MS
+	): Promise<Event[]> {
+		return new Promise((resolve) => {
+			const chunkEvents: Event[] = [];
+			const subscription = pool.subscribeMany(relays, filter, {
+				onevent(event) {
+					chunkEvents.push(event);
+				},
+				oneose() {
+					cleanup();
+					resolve(chunkEvents);
+				},
+				onclose() {
+					cleanup();
+					resolve(chunkEvents);
+				}
+			});
+
+			const timeoutId = setTimeout(() => {
+				cleanup();
+				resolve(chunkEvents);
+			}, timeoutMs);
+
+			function cleanup() {
+				clearTimeout(timeoutId);
+				void subscription?.close();
+			}
+		});
+	}
+
 	// Nostrイベントを取得してCSVに変換
 	async function fetchAndConvertToCSV() {
 		errorMessage = '';
@@ -59,46 +103,73 @@
 			// SimplePoolを使用してイベントを取得
 			const pool = new SimplePool();
 			const events: Event[] = [];
+			const seenEventIds = new Set<string>();
+			let until: number | undefined;
 
-			// kind1イベントを取得
-			const sub = pool.subscribeMany(
-				relays,
-				{
-					kinds: [1],
-					authors: [pubkeyHex]
-				},
-				{
-					onevent(event) {
-						events.push(event);
-					},
-					oneose() {
-						// すべてのリレーからEOSE（End Of Stored Events）を受信したら処理を終了
-						setTimeout(() => {
-							pool.close(relays);
+			try {
+				while (true) {
+					const filter: Kind1Filter = {
+						kinds: [1],
+						authors: [pubkeyHex],
+						limit: CHUNK_EVENT_LIMIT
+					};
 
-							// イベントをタイムスタンプでソート（古い順）
-							events.sort((a, b) => a.created_at - b.created_at);
+					if (typeof until === 'number') {
+						filter.until = until;
+					}
 
-							// CSVに変換
-							const csvLines = ['content,timestamp'];
-							for (const event of events) {
-								const content = escapeCSV(event.content);
-								const timestamp = new Date(event.created_at * 1000).toISOString();
-								csvLines.push(`${content},${timestamp}`);
-							}
+					const chunk = await fetchChunkFromRelays(pool, relays, filter);
 
-							csvOutput = csvLines.join('\n');
-							isLoading = false;
+					if (chunk.length === 0) {
+						break;
+					}
 
-							if (events.length === 0) {
-								successMessage = 'No kind1 events found for this user';
-							} else {
-								successMessage = `Successfully fetched ${events.length} kind1 events`;
-							}
-						}, 1000); // 1秒待ってから終了（すべてのイベントを確実に取得するため）
+					let oldestTimestamp = chunk[0].created_at;
+
+					for (const event of chunk) {
+						if (event.created_at < oldestTimestamp) {
+							oldestTimestamp = event.created_at;
+						}
+
+						if (!seenEventIds.has(event.id)) {
+							seenEventIds.add(event.id);
+							events.push(event);
+						}
+					}
+
+					if (chunk.length < CHUNK_EVENT_LIMIT) {
+						break;
+					}
+
+					until = oldestTimestamp - 1;
+
+					if (until < 0) {
+						break;
 					}
 				}
-			);
+			} finally {
+				pool.close(relays);
+			}
+
+			// イベントをタイムスタンプでソート（古い順）
+			events.sort((a, b) => a.created_at - b.created_at);
+
+			// CSVに変換
+			const csvLines = ['content,timestamp'];
+			for (const event of events) {
+				const content = escapeCSV(event.content);
+				const timestamp = new Date(event.created_at * 1000).toISOString();
+				csvLines.push(`${content},${timestamp}`);
+			}
+
+			csvOutput = csvLines.join('\n');
+			isLoading = false;
+
+			if (events.length === 0) {
+				successMessage = 'No kind1 events found for this user';
+			} else {
+				successMessage = `Successfully fetched ${events.length} kind1 events`;
+			}
 		} catch (error) {
 			isLoading = false;
 			errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
